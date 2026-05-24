@@ -19,6 +19,40 @@
 - **Safe Against Recursion**
   - Shell functions are not inherited by child processes, so when the recorder internally invokes the real `kubectl` binary the wrapping function does not re-fire. No infinite loop, no special escaping needed.
 
+example)
+```
+DESKTOP-PUNDP46% kubectl apply -f nginx.yaml
+deployment.apps/nginx-deployment created
+DESKTOP-PUNDP46% ls -la ~/.kube/kubectl-history/
+total 16
+drwxr-xr-x 3 ady ady 4096 May 24 14:03 .
+drwxr-xr-x 5 ady ady 4096 May 24 14:02 ..
+-rw-r--r-- 1 ady ady  630 May 24 14:03 history.jsonl
+drwxr-xr-x 2 ady ady 4096 May 24 14:03 snapshots
+DESKTOP-PUNDP46% cat ~/.kube/kubectl-history/history.jsonl
+{"timestamp":"2026-05-24T14:03:59+0900","operation":"apply","user":"ady","host":"DESKTOP-PUNDP46","cwd":"/mnt/c/Users/yasuta/Desktop/kubectl-rec","context":"k3d-dev","cluster":"k3d-dev","namespace":"default","dry_run":"","command":["kubectl","apply","-f","nginx.yaml"],"sources":[{"type":"file","input":"nginx.yaml","path":"/mnt/c/Users/yasuta/Desktop/kubectl-rec/nginx.yaml","sha256":"4b7150aa031043fc56aa0f67bde7c9bf2d1f6649144450f5b5d785bbce60668a","snapshot":"/home/ady/.kube/kubectl-history/snapshots/20260524T140358-4b7150aa0310-nginx.yaml"}],"exit_code":0,"stdout":"deployment.apps/nginx-deployment created\n","stderr":""}
+DESKTOP-PUNDP46% cat ~/.kube/kubectl-history/snapshots/20260524T140358-4b7150aa0310-nginx.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+```
+
 ## v0.1
 
 - **Initial release**
