@@ -15,279 +15,322 @@
 #     ├── history.jsonl                                   1 操作 = 1 行
 #     └── snapshots/<timestamp>-<sha12>-<filename>        -f / -k で渡された実体
 #
-# 依存: bash 4.0+, jq 1.6+, kubectl, (sha256sum | shasum)
+# 依存: bash 3.2+, jq 1.5+, kubectl, (sha256sum | shasum)
+# WSL Ubuntu bash で動作確認済み
 # =============================================================================
 
-set -euo pipefail
+# set -euo pipefail / set -u を使わない
+# bash と zsh の挙動差・WSL固有の制限を避けるため、
+# エラーチェックはすべて明示的に行う
 
 # ---------- Configuration ---------------------------------------------------
 HISTORY_DIR="${KUBECTL_HISTORY_DIR:-$HOME/.kube/kubectl-history}"
 INDEX_FILE="$HISTORY_DIR/history.jsonl"
 SNAPSHOT_DIR="$HISTORY_DIR/snapshots"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
-# HISTORY_DIR / SNAPSHOT_DIR を最初に作成（stdin用mktempより前に必要）
-mkdir -p "$SNAPSHOT_DIR"
+
+# HISTORY_DIR / SNAPSHOT_DIR を最初に作成
+if ! mkdir -p "$SNAPSHOT_DIR"; then
+  echo "[kubectl-rec] ERROR: cannot create $SNAPSHOT_DIR" >&2
+  exit 1
+fi
 
 # ---------- Helpers ---------------------------------------------------------
 die()  { echo "[kubectl-rec] ERROR: $*" >&2; exit 1; }
+warn() { echo "[kubectl-rec] WARN: $*"  >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 have jq             || die "jq is required (apt-get install jq / brew install jq)"
 have "$KUBECTL_BIN" || die "$KUBECTL_BIN not found in PATH"
 
+# WSL: Windows の find.exe / sort.exe が PATH に混入することがあるため
+# Linux の /usr/bin 版を明示的に使う
+FIND_CMD="/usr/bin/find"
+SORT_CMD="/usr/bin/sort"
+[ -x "$FIND_CMD" ] || FIND_CMD="$(command -v find 2>/dev/null)"
+[ -x "$SORT_CMD" ] || SORT_CMD="$(command -v sort 2>/dev/null)"
 
 sha256_of() {
-  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
-  else                    shasum -a 256 "$1" | awk '{print $1}'
+  if have sha256sum; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif have shasum; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else
+    printf ''
   fi
 }
 
 abspath() {
   case "$1" in
-    -|http://*|https://*) printf '%s' "$1"; return;;
+    -|http://*|https://*) printf '%s' "$1"; return ;;
   esac
   if have realpath; then
-    realpath "$1"
+    realpath --canonicalize-missing "$1" 2>/dev/null || printf '%s' "$1"
   elif have python3; then
-    python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"
-  else
-    (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "$1")") \
+    python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
       || printf '%s' "$1"
+  else
+    ( cd "$(dirname "$1")" 2>/dev/null \
+      && printf '%s/%s' "$(pwd)" "$(basename "$1")" ) || printf '%s' "$1"
   fi
 }
 
-# ファイルの内容を JSON 文字列に変換（--rawfile を使わない互換実装）
-# python3 で確実にエスケープ（jq 1.5/1.6 両対応、WSL環境での互換性が高い）
+# ファイル内容を JSON 文字列値に変換
+# jq --rawfile (1.6+) に頼らず python3 / jq -Rs で処理
 file_to_json_str() {
-  local path="$1"
-  # python3 で確実にエスケープ（WSL環境での互換性が最も高い）
+  local _p="$1"
   if have python3; then
     python3 -c '
 import sys, json
-with open(sys.argv[1], "r", errors="replace") as f:
-    print(json.dumps(f.read()), end="")
-' "$path"
+try:
+    data = open(sys.argv[1], "r", errors="replace").read()
+except Exception:
+    data = ""
+sys.stdout.write(json.dumps(data))
+' "$_p" 2>/dev/null || printf '""'
   else
-    # フォールバック: jq で文字列化
-    jq -Rs '.' < "$path"
+    jq -Rs '.' < "$_p" 2>/dev/null || printf '""'
   fi
 }
 
-iso_now()   { date "+%Y-%m-%dT%H:%M:%S%z"; }
+# JSON 配列に source エントリを追加 (pipe 使用、herestring 不使用)
+append_source() {
+  local _json="$1" _type="$2" _input="$3" _path="$4" _sha="$5" _snap="$6"
+  printf '%s' "$_json" | jq -c \
+    --arg type  "$_type"  \
+    --arg input "$_input" \
+    --arg path  "$_path"  \
+    --arg sha   "$_sha"   \
+    --arg snap  "$_snap"  \
+    '. + [{type:$type,input:$input,path:$path,sha256:$sha,snapshot:$snap}]' \
+    2>/dev/null || printf '%s' "$_json"
+}
+
+iso_now()   { date "+%Y-%m-%dT%H:%M:%S%z" 2>/dev/null || date -u "+%Y-%m-%dT%H:%M:%SZ"; }
 stamp_now() { date "+%Y%m%dT%H%M%S"; }
 
 # ---------- Detect operation ------------------------------------------------
-# argv の中から最初に現れる apply/delete/replace/patch を「操作」とみなす。
-# (本物の kubectl と同じく、global flag は無視して最初の positional を拾う)
 OP=""
-SKIP=0
-for a in "$@"; do
-  if [ $SKIP -eq 1 ]; then SKIP=0; continue; fi
-  case "$a" in
+_skip=0
+for _a in "$@"; do
+  if [ "$_skip" = "1" ]; then _skip=0; continue; fi
+  case "$_a" in
     --kubeconfig|--context|-n|--namespace|--cluster|--user|--server|--token|\
 --certificate-authority|--client-key|--client-certificate|--as|--as-group|-s)
-      SKIP=1;;
+      _skip=1 ;;
     -*) ;;
     *)
-      # [[ =~ ]] の代わりに case を使い、bash/dash 両対応
-      case "$a" in
-        apply|delete|replace|patch) OP="$a"; break;;
-        *) die "unsupported operation: '$a' (supported: apply/delete/replace/patch)";;
-      esac
-      ;;
+      case "$_a" in
+        apply|delete|replace|patch)
+          OP="$_a"; break ;;
+        *)
+          die "unsupported operation: '$_a' (supported: apply/delete/replace/patch)" ;;
+      esac ;;
   esac
 done
 [ -z "$OP" ] && die "no supported operation found in args"
 
 # ---------- Parse -f / -k / -R from argv ------------------------------------
-# 注意: set -u 環境で空配列を展開すると bash 4.4 未満でエラーになる場合があるため
-#       配列の展開は "${arr[@]+"${arr[@]}"}" パターンを使う
 declare -a F_VALUES=()
 declare -a K_VALUES=()
 RECURSIVE=0
 DRY_RUN=""
-declare -a PASSTHRU=("$@")   # そのまま kubectl に渡す
+declare -a PASSTHRU=("$@")
 
-i=0
-while [ $i -lt ${#PASSTHRU[@]} ]; do
-  a="${PASSTHRU[$i]}"
-  case "$a" in
+_n="${#PASSTHRU[@]}"
+_i=0
+while [ "$_i" -lt "$_n" ]; do
+  _a="${PASSTHRU[$_i]}"
+  _j=$(( _i + 1 ))
+  case "$_a" in
     -f|--filename)
-      # 次の要素が存在するか確認してから取得（境界チェック）
-      if [ $((i+1)) -lt ${#PASSTHRU[@]} ]; then
-        F_VALUES+=("${PASSTHRU[$((i+1))]}")
-      fi
-      i=$((i+2));;
-    -f=*|--filename=*)        F_VALUES+=("${a#*=}");                  i=$((i+1));;
+      if [ "$_j" -lt "$_n" ]; then F_VALUES+=("${PASSTHRU[$_j]}"); fi
+      _i=$(( _i + 2 )) ;;
+    -f=*|--filename=*)
+      F_VALUES+=("${_a#*=}"); _i=$(( _i + 1 )) ;;
     -k|--kustomize)
-      if [ $((i+1)) -lt ${#PASSTHRU[@]} ]; then
-        K_VALUES+=("${PASSTHRU[$((i+1))]}")
-      fi
-      i=$((i+2));;
-    -k=*|--kustomize=*)       K_VALUES+=("${a#*=}");                  i=$((i+1));;
-    -R|--recursive)           RECURSIVE=1;                            i=$((i+1));;
+      if [ "$_j" -lt "$_n" ]; then K_VALUES+=("${PASSTHRU[$_j]}"); fi
+      _i=$(( _i + 2 )) ;;
+    -k=*|--kustomize=*)
+      K_VALUES+=("${_a#*=}"); _i=$(( _i + 1 )) ;;
+    -R|--recursive)
+      RECURSIVE=1; _i=$(( _i + 1 )) ;;
     --dry-run)
-      if [ $((i+1)) -lt ${#PASSTHRU[@]} ]; then
-        DRY_RUN="${PASSTHRU[$((i+1))]}"
-      fi
-      i=$((i+2));;
-    --dry-run=*)              DRY_RUN="${a#*=}";                       i=$((i+1));;
-    *)                                                                i=$((i+1));;
+      if [ "$_j" -lt "$_n" ]; then DRY_RUN="${PASSTHRU[$_j]}"; fi
+      _i=$(( _i + 2 )) ;;
+    --dry-run=*)
+      DRY_RUN="${_a#*=}"; _i=$(( _i + 1 )) ;;
+    *)
+      _i=$(( _i + 1 )) ;;
   esac
 done
 
-# ---------- Handle stdin (-f -) --------------------------------------------
+# ---------- Handle stdin (-f -) ---------------------------------------------
 STDIN_SNAPSHOT=""
-for idx in "${!PASSTHRU[@]}"; do
-  prev_idx=$((idx-1))
-  if [ "${PASSTHRU[$idx]}" = "-" ] && [ $prev_idx -ge 0 ]; then
-    prev="${PASSTHRU[$prev_idx]}"
-    if [ "$prev" = "-f" ] || [ "$prev" = "--filename" ]; then
-      # SNAPSHOT_DIR は既に mkdir -p 済みなので安全
-      STDIN_SNAPSHOT="$(mktemp "$SNAPSHOT_DIR/.stdin.XXXXXX.yaml")"
+_pi=0
+while [ "$_pi" -lt "$_n" ]; do
+  if [ "${PASSTHRU[$_pi]}" = "-" ] && [ "$_pi" -gt 0 ]; then
+    _prev="${PASSTHRU[$(( _pi - 1 ))]}"
+    if [ "$_prev" = "-f" ] || [ "$_prev" = "--filename" ]; then
+      STDIN_SNAPSHOT="$(mktemp "$SNAPSHOT_DIR/.stdin.XXXXXX.yaml" 2>/dev/null)" \
+        || STDIN_SNAPSHOT="$(mktemp)"
       cat > "$STDIN_SNAPSHOT"
-      PASSTHRU[$idx]="$STDIN_SNAPSHOT"
-      for j in "${!F_VALUES[@]}"; do
-        [ "${F_VALUES[$j]}" = "-" ] && F_VALUES[$j]="$STDIN_SNAPSHOT"
+      PASSTHRU[$_pi]="$STDIN_SNAPSHOT"
+      _fi=0
+      while [ "$_fi" -lt "${#F_VALUES[@]}" ]; do
+        if [ "${F_VALUES[$_fi]}" = "-" ]; then F_VALUES[$_fi]="$STDIN_SNAPSHOT"; fi
+        _fi=$(( _fi + 1 ))
       done
       break
     fi
   fi
+  _pi=$(( _pi + 1 ))
 done
 
-# ---------- Resolve -f / -k specs ------------------------------------------
-resolve_sources() {
-  local spec f
-  # 空配列の安全な展開: 要素がある場合のみ展開
-  if [ ${#F_VALUES[@]} -gt 0 ]; then
-    for spec in "${F_VALUES[@]}"; do
-      [ -z "$spec" ] && continue
-      case "$spec" in
-        http://*|https://*) echo "url|$spec|$spec";;
-        *)
-          if [ -d "$spec" ]; then
-            if [ $RECURSIVE -eq 1 ]; then
-              find "$spec" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) | sort \
-                | while read -r f; do echo "file|$spec|$(abspath "$f")"; done
-            else
-              find "$spec" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) | sort \
-                | while read -r f; do echo "file|$spec|$(abspath "$f")"; done
-            fi
-          elif [ -f "$spec" ]; then
-            echo "file|$spec|$(abspath "$spec")"
-          else
-            echo "missing|$spec|$spec"
-          fi
-          ;;
-      esac
-    done
-  fi
-  if [ ${#K_VALUES[@]} -gt 0 ]; then
-    for spec in "${K_VALUES[@]}"; do
-      [ -z "$spec" ] && continue
-      echo "kustomize|$spec|$(abspath "$spec")"
-    done
-  fi
-}
+# ---------- Resolve -f/-k → tmpfile (プロセス置換を使わない WSL 互換) -------
+_SOURCES_TMP="$(mktemp)"
 
-# ---------- Snapshot + build sources JSON ----------------------------------
-TS_FILE="$(stamp_now)"
+{
+  _fi=0
+  while [ "$_fi" -lt "${#F_VALUES[@]}" ]; do
+    _spec="${F_VALUES[$_fi]}"
+    _fi=$(( _fi + 1 ))
+    [ -z "$_spec" ] && continue
+    case "$_spec" in
+      http://*|https://*)
+        printf 'url|%s|%s\n' "$_spec" "$_spec" ;;
+      *)
+        if [ -d "$_spec" ]; then
+          if [ "$RECURSIVE" = "1" ]; then
+            "$FIND_CMD" "$_spec" -type f \
+              \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+              2>/dev/null | "$SORT_CMD" | while IFS= read -r _f; do
+              printf 'file|%s|%s\n' "$_spec" "$(abspath "$_f")"
+            done
+          else
+            "$FIND_CMD" "$_spec" -maxdepth 1 -type f \
+              \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+              2>/dev/null | "$SORT_CMD" | while IFS= read -r _f; do
+              printf 'file|%s|%s\n' "$_spec" "$(abspath "$_f")"
+            done
+          fi
+        elif [ -f "$_spec" ]; then
+          printf 'file|%s|%s\n' "$_spec" "$(abspath "$_spec")"
+        else
+          printf 'missing|%s|%s\n' "$_spec" "$_spec"
+        fi ;;
+    esac
+  done
+
+  _ki=0
+  while [ "$_ki" -lt "${#K_VALUES[@]}" ]; do
+    _spec="${K_VALUES[$_ki]}"
+    _ki=$(( _ki + 1 ))
+    [ -z "$_spec" ] && continue
+    printf 'kustomize|%s|%s\n' "$_spec" "$(abspath "$_spec")"
+  done
+} > "$_SOURCES_TMP"
+
+# ---------- Snapshot + build sources JSON -----------------------------------
+_TS="$(stamp_now)"
 SOURCES_JSON='[]'
 
-while IFS='|' read -r src_type input absp; do
-  [ -z "$src_type" ] && continue
-  snap_path=""; sha=""
+while IFS='|' read -r _stype _sinput _sabsp; do
+  [ -z "$_stype" ] && continue
+  _snap="" _sha=""
 
-  case "$src_type" in
+  case "$_stype" in
     file)
-      if [ -f "$absp" ]; then
-        sha="$(sha256_of "$absp")"
-        snap_path="$SNAPSHOT_DIR/${TS_FILE}-${sha:0:12}-$(basename "$absp")"
-        [ -f "$snap_path" ] || cp "$absp" "$snap_path"
-      fi
-      ;;
-    kustomize)
-      if [ -d "$absp" ]; then
-        snap_path="$SNAPSHOT_DIR/${TS_FILE}-kustomize-$(basename "$absp").yaml"
-        if "$KUBECTL_BIN" kustomize "$absp" > "$snap_path" 2>/dev/null; then
-          sha="$(sha256_of "$snap_path")"
-        else
-          rm -f "$snap_path"; snap_path=""
+      if [ -f "$_sabsp" ]; then
+        _sha="$(sha256_of "$_sabsp")"
+        _snap="$SNAPSHOT_DIR/${_TS}-${_sha:0:12}-$(basename "$_sabsp")"
+        if [ ! -f "$_snap" ]; then
+          cp "$_sabsp" "$_snap" 2>/dev/null || _snap=""
         fi
-      fi
-      ;;
-    url|missing) : ;;
+      fi ;;
+    kustomize)
+      if [ -d "$_sabsp" ]; then
+        _snap="$SNAPSHOT_DIR/${_TS}-kustomize-$(basename "$_sabsp").yaml"
+        if "$KUBECTL_BIN" kustomize "$_sabsp" > "$_snap" 2>/dev/null; then
+          _sha="$(sha256_of "$_snap")"
+        else
+          rm -f "$_snap"; _snap=""
+        fi
+      fi ;;
+    url|missing) ;;
   esac
 
-  SOURCES_JSON="$(
-    jq -c \
-      --arg type  "$src_type" \
-      --arg input "$input" \
-      --arg path  "$absp" \
-      --arg sha   "$sha" \
-      --arg snap  "$snap_path" \
-      '. + [{type:$type, input:$input, path:$path, sha256:$sha, snapshot:$snap}]' \
-      <<< "$SOURCES_JSON"
-  )"
-done < <(resolve_sources)
+  SOURCES_JSON="$(append_source "$SOURCES_JSON" "$_stype" "$_sinput" "$_sabsp" "$_sha" "$_snap")"
+done < "$_SOURCES_TMP"
+rm -f "$_SOURCES_TMP"
 
-# ---------- Run actual kubectl ---------------------------------------------
-# Note: 子プロセス内ではシェル関数 kubectl() は継承されないので、
-#       ここで $KUBECTL_BIN を呼んでも再帰しない。
+# ---------- Run actual kubectl ----------------------------------------------
 STDOUT_TMP="$(mktemp)"
 STDERR_TMP="$(mktemp)"
-trap '[ -n "${STDIN_SNAPSHOT:-}" ] && rm -f "$STDIN_SNAPSHOT"; rm -f "$STDOUT_TMP" "$STDERR_TMP"' EXIT
 
-set +e
-"$KUBECTL_BIN" "${PASSTHRU[@]}" >"$STDOUT_TMP" 2>"$STDERR_TMP"
+_cleanup() {
+  [ -n "$STDIN_SNAPSHOT" ] && rm -f "$STDIN_SNAPSHOT"
+  rm -f "$STDOUT_TMP" "$STDERR_TMP"
+}
+trap _cleanup EXIT
+
+"$KUBECTL_BIN" "${PASSTHRU[@]}" > "$STDOUT_TMP" 2> "$STDERR_TMP"
 EXIT_CODE=$?
-set -e
 
 cat "$STDOUT_TMP"
 cat "$STDERR_TMP" >&2
 
-# ---------- Capture context info -------------------------------------------
-CTX="$("$KUBECTL_BIN" config current-context 2>/dev/null || echo "")"
-CLUSTER="$("$KUBECTL_BIN" config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")"
-NS="$("$KUBECTL_BIN" config view --minify -o jsonpath='{..namespace}' 2>/dev/null || echo "")"
+# ---------- Capture context info --------------------------------------------
+CTX="$("$KUBECTL_BIN" config current-context 2>/dev/null)" || CTX=""
+CLUSTER="$("$KUBECTL_BIN" config view --minify -o "jsonpath={.clusters[0].name}" 2>/dev/null)" || CLUSTER=""
+NS="$("$KUBECTL_BIN" config view --minify -o "jsonpath={..namespace}" 2>/dev/null)" || NS=""
 [ -z "$NS" ] && NS="default"
 
-# ---------- stdout / stderr を JSON文字列化（jq --rawfile の代替）-----------
+# ---------- stdout/stderr を JSON 文字列に変換 ------------------------------
 STDOUT_JSON="$(file_to_json_str "$STDOUT_TMP")"
 STDERR_JSON="$(file_to_json_str "$STDERR_TMP")"
 
-# ---------- コマンドライン配列を JSON 配列化 --------------------------------
-CMD_JSON="$(
-  # PASSTHRU を JSON 配列に変換（set -u 安全のため要素数を確認）
-  if [ ${#PASSTHRU[@]} -gt 0 ]; then
-    printf '%s\0' "$KUBECTL_BIN" "${PASSTHRU[@]}" \
-      | python3 -c '
+# ---------- コマンド配列を JSON 配列に変換 ----------------------------------
+CMD_JSON="[]"
+if have python3; then
+  _CMD_TMP="$(mktemp)"
+  printf '%s\0' "$KUBECTL_BIN" "${PASSTHRU[@]}" > "$_CMD_TMP"
+  CMD_JSON="$(python3 -c '
 import sys, json
-args = sys.stdin.read().split("\x00")
-args = [a for a in args if a != ""]
+raw = open(sys.argv[1], "rb").read()
+args = [a.decode("utf-8", errors="replace") for a in raw.split(b"\x00") if a]
 print(json.dumps(args))
-'
-  else
-    echo "[]"
-  fi
-)"
+' "$_CMD_TMP" 2>/dev/null)" || CMD_JSON="[]"
+  rm -f "$_CMD_TMP"
+else
+  # python3 がない場合: jq で一つずつ追加
+  for _item in "$KUBECTL_BIN" "${PASSTHRU[@]}"; do
+    CMD_JSON="$(printf '%s' "$CMD_JSON" \
+      | jq -c --arg v "$_item" '. + [$v]' 2>/dev/null)" || true
+  done
+fi
 
-# ---------- Append index entry ---------------------------------------------
+# ---------- Append history entry --------------------------------------------
+_USER="${USER:-}"
+[ -z "$_USER" ] && _USER="$(id -un 2>/dev/null)" || true
+[ -z "$_USER" ] && _USER="unknown"
+_HOST="$(hostname 2>/dev/null)" || _HOST="unknown"
+
 jq -cn \
-  --arg ts        "$(iso_now)" \
-  --arg op        "$OP" \
-  --arg user      "${USER:-$(id -un 2>/dev/null || echo unknown)}" \
-  --arg host      "$(hostname 2>/dev/null || echo unknown)" \
-  --arg cwd       "$(pwd)" \
-  --arg context   "$CTX" \
-  --arg cluster   "$CLUSTER" \
-  --arg namespace "$NS" \
-  --arg dry_run   "$DRY_RUN" \
-  --argjson exit    "$EXIT_CODE" \
+  --arg ts        "$(iso_now)"  \
+  --arg op        "$OP"         \
+  --arg user      "$_USER"      \
+  --arg host      "$_HOST"      \
+  --arg cwd       "$(pwd)"      \
+  --arg context   "$CTX"        \
+  --arg cluster   "$CLUSTER"    \
+  --arg namespace "$NS"         \
+  --arg dry_run   "$DRY_RUN"    \
+  --argjson exit    "$EXIT_CODE"    \
   --argjson sources "$SOURCES_JSON" \
-  --argjson command "$CMD_JSON" \
-  --argjson stdout  "$STDOUT_JSON" \
-  --argjson stderr  "$STDERR_JSON" \
+  --argjson command "$CMD_JSON"     \
+  --argjson stdout  "$STDOUT_JSON"  \
+  --argjson stderr  "$STDERR_JSON"  \
   '{
     timestamp:  $ts,
     operation:  $op,
@@ -303,7 +346,7 @@ jq -cn \
     exit_code:  $exit,
     stdout:     $stdout,
     stderr:     $stderr
-  }' \
-  >> "$INDEX_FILE"
+  }' >> "$INDEX_FILE" \
+  || warn "failed to write history entry to $INDEX_FILE"
 
 exit "$EXIT_CODE"
